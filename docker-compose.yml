@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./server
+    container_name: tai-backend
+    environment:
+      - PORT=4000
+      - DB_FILE=/app/data/app.db
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./server/data:/app/data
+
+  frontend:
+    build: ./client
+    container_name: tai-frontend
+    environment:
+      - VITE_API_BASE=http://backend:4000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    command: ["npm", "run", "start", "--", "--host", "0.0.0.0", "--port", "5173"]
