@@ -1,8 +1,10 @@
 const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
+const { rateLimit } = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
 const morgan = require("morgan");
+const argon2 = require("argon2");
 
 const {
   get,
@@ -11,18 +13,45 @@ const {
   initializeSchema,
   closeDb,
   hashToken,
+  withTransaction,
 } = require("./database");
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || "0.0.0.0";
-const JWT_SECRET = process.env.JWT_SECRET || "ai-city-secret";
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PRODUCTION = NODE_ENV === "production";
+const JWT_SECRET = (() => {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (IS_PRODUCTION) {
+    throw new Error("JWT_SECRET must be configured when NODE_ENV=production");
+  }
+  // A development/test secret is intentionally explicit and may never be used in production.
+  return "development-only-ai-city-jwt-secret";
+})();
 const ACCESS_TTL = process.env.ACCESS_TTL || "15m";
 const REFRESH_TTL_DAYS = Number.parseInt(process.env.REFRESH_TTL_DAYS || "14", 10);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^\+?\d{6,20}$/;
+const CORS_ALLOWED_ORIGINS = new Set(
+  (process.env.CORS_ALLOWED_ORIGINS || (IS_PRODUCTION ? "" : "http://localhost:5173,http://127.0.0.1:5173"))
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
+const LOGIN_RATE_LIMIT_WINDOW_MS = Number.parseInt(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || "900000", 10);
+const LOGIN_RATE_LIMIT_MAX = Number.parseInt(process.env.LOGIN_RATE_LIMIT_MAX || "10", 10);
 
-app.use(cors());
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || CORS_ALLOWED_ORIGINS.has(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("CORS origin is not allowed"));
+    },
+  })
+);
 app.use(morgan("dev"));
 app.use(
   express.json({
@@ -151,27 +180,63 @@ function buildPasswordDigest(password, salt) {
     .digest("hex");
 }
 
-function makePasswordRecord(password) {
-  const salt = crypto.randomBytes(16).toString("hex");
+async function makePasswordRecord(password) {
+  const passwordHash = await argon2.hash(String(password || ""), {
+    type: argon2.argon2id,
+    memoryCost: 19456,
+    timeCost: 2,
+    parallelism: 1,
+  });
   return {
-    password_hash: buildPasswordDigest(password, salt),
-    password_salt: salt,
+    password_hash: passwordHash,
+    password_salt: null,
   };
 }
 
-function verifyPassword(password, password_hash, password_salt) {
-  if (!password_hash || !password_salt) {
-    return false;
+async function verifyPassword(password, password_hash, password_salt) {
+  if (!password_hash) {
+    return { valid: false, legacy: false };
+  }
+  if (password_hash.startsWith("$argon2id$")) {
+    try {
+      return { valid: await argon2.verify(password_hash, String(password || "")), legacy: false };
+    } catch (_error) {
+      return { valid: false, legacy: false };
+    }
+  }
+  if (!password_salt) {
+    return { valid: false, legacy: false };
   }
   const candidate = buildPasswordDigest(password, password_salt);
   if (candidate.length !== password_hash.length) {
-    return false;
+    return { valid: false, legacy: true };
   }
-  return crypto.timingSafeEqual(
+  return {
+    valid: crypto.timingSafeEqual(
     Buffer.from(candidate),
     Buffer.from(password_hash)
-  );
+    ),
+    legacy: true,
+  };
 }
+
+function demoSeedAllowed() {
+  return !IS_PRODUCTION && process.env.DEMO_SEED_ENABLED === "true";
+}
+
+const loginRateLimiter = rateLimit({
+  windowMs: Number.isFinite(LOGIN_RATE_LIMIT_WINDOW_MS) ? LOGIN_RATE_LIMIT_WINDOW_MS : 900000,
+  limit: Number.isFinite(LOGIN_RATE_LIMIT_MAX) ? LOGIN_RATE_LIMIT_MAX : 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator(req) {
+    const identity = parseAuthIdentity({ account: req.body?.account }).identity || "unknown";
+    return `${req.socket?.remoteAddress || "unknown"}:${identity}`;
+  },
+  handler(_req, res) {
+    return failResponse(res, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试", 429);
+  },
+});
 
 function makeAccessToken(user) {
   return jwt.sign(
@@ -509,7 +574,7 @@ async function ensureSeedUser(email, nickname, role, defaultPassword = "") {
   const exists = await get("SELECT id, password_hash FROM users WHERE email = ?", [email]);
   if (exists?.id) {
     if (!exists.password_hash && defaultPassword) {
-      const { password_hash, password_salt } = makePasswordRecord(defaultPassword);
+      const { password_hash, password_salt } = await makePasswordRecord(defaultPassword);
       await run(
         "UPDATE users SET password_hash = ?, password_salt = ?, role = COALESCE(role, ?), nickname = COALESCE(nickname, ?) WHERE id = ?",
         [password_hash, password_salt, role, nickname, exists.id]
@@ -519,7 +584,7 @@ async function ensureSeedUser(email, nickname, role, defaultPassword = "") {
   }
 
   const seedPassword = defaultPassword
-    ? makePasswordRecord(defaultPassword)
+    ? await makePasswordRecord(defaultPassword)
     : { password_hash: null, password_salt: null };
   const inserted = await run(
     "INSERT INTO users (email, nickname, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)",
@@ -704,7 +769,7 @@ app.post("/api/v1/auth/register", async (req, res) => {
     if (exists.password_hash) {
       return failResponse(res, "ACCOUNT_EXISTS", "账号已存在");
     }
-    const { password_hash, password_salt } = makePasswordRecord(password);
+    const { password_hash, password_salt } = await makePasswordRecord(password);
     await run(
       `UPDATE users SET nickname = ?, password_hash = ?, password_salt = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [safeNickname, password_hash, password_salt, exists.id]
@@ -722,7 +787,7 @@ app.post("/api/v1/auth/register", async (req, res) => {
     });
   }
 
-  const { password_hash, password_salt } = makePasswordRecord(password);
+  const { password_hash, password_salt } = await makePasswordRecord(password);
   const inserted = await run(
     `INSERT INTO users (${identityColumn}, nickname, role, status, password_hash, password_salt) VALUES (?, ?, 'user', 'active', ?, ?)`,
     [identity, safeNickname, password_hash, password_salt]
@@ -745,7 +810,7 @@ app.post("/api/v1/auth/register", async (req, res) => {
   });
 });
 
-app.post("/api/v1/auth/login", async (req, res) => {
+app.post("/api/v1/auth/login", loginRateLimiter, async (req, res) => {
   const { account, password } = req.body || {};
   const { identity, identityType } = parseAuthIdentity({ account });
 
@@ -764,7 +829,8 @@ app.post("/api/v1/auth/login", async (req, res) => {
   if (!user) {
     return failResponse(res, "INVALID_CREDENTIALS", "账号不存在或密码错误");
   }
-  if (!verifyPassword(password, user.password_hash, user.password_salt)) {
+  const passwordResult = await verifyPassword(password, user.password_hash, user.password_salt);
+  if (!passwordResult.valid) {
     return failResponse(res, "INVALID_CREDENTIALS", "账号不存在或密码错误");
   }
 
@@ -772,10 +838,18 @@ app.post("/api/v1/auth/login", async (req, res) => {
     return failResponse(res, "ACCOUNT_DISABLED", "账号已被封禁");
   }
 
-  await run(
-    "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    [user.id]
-  );
+  if (passwordResult.legacy) {
+    const upgraded = await makePasswordRecord(password);
+    await run(
+      "UPDATE users SET password_hash = ?, password_salt = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [upgraded.password_hash, user.id]
+    );
+  } else {
+    await run(
+      "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [user.id]
+    );
+  }
   const refreshToken = await issueRefreshToken(user.id);
   await logAudit("auth.login", req, "user", user.id, { identityType });
 
@@ -849,6 +923,9 @@ app.get("/api/v1/user/me", requireAuth, async (req, res) => {
 });
 
 app.post("/api/v1/admin/seed-demo", requireAuth, requireAdmin, async (req, res) => {
+  if (!demoSeedAllowed()) {
+    return failResponse(res, "DEMO_SEED_DISABLED", "演示数据初始化未启用", 403);
+  }
   try {
     await ensureDemoSeed();
     const summaryRows = await all(
@@ -1149,56 +1226,42 @@ app.post("/api/v1/events/:id/register", requireAuth, async (req, res) => {
   if (!id) {
     return failResponse(res, "INVALID_ID", "活动 ID 不合法");
   }
-  const event = await get("SELECT * FROM events WHERE id = ?", [id]);
-  if (!event) {
-    return failResponse(res, "NOT_FOUND", "活动不存在", 404);
-  }
-  if (event.status !== "published") {
-    return failResponse(res, "NOT_AVAILABLE", "当前活动不可报名", 403);
-  }
-  if (new Date(event.end_time) <= new Date()) {
-    if (event.status === "published") {
-      try {
-        await run("UPDATE events SET status = 'ended' WHERE id = ?", [id]);
-      } catch (_err) {
-        // ignore
-      }
+  const result = await withTransaction(async (transaction) => {
+    const event = await transaction.get("SELECT * FROM events WHERE id = ?", [id]);
+    if (!event) return { error: ["NOT_FOUND", "活动不存在", 404] };
+    if (event.status !== "published") return { error: ["NOT_AVAILABLE", "当前活动不可报名", 403] };
+    if (new Date(event.end_time) <= new Date()) {
+      await transaction.run("UPDATE events SET status = 'ended' WHERE id = ?", [id]);
+      return { error: ["EVENT_ENDED", "活动已结束", 409] };
     }
-    return failResponse(res, "EVENT_ENDED", "活动已结束", 409);
-  }
-  if ((event.signup_type || "manual") !== "manual") {
-    return failResponse(res, "NOT_AVAILABLE", "当前活动不支持站内报名", 403);
-  }
-
-  const regCount = await get(
-    "SELECT COUNT(*) AS total FROM event_registrations WHERE event_id = ? AND status = 'registered'",
-    [id]
-  );
-  if (event.capacity > 0 && regCount.total >= event.capacity) {
-    return failResponse(res, "FULL", "名额已满", 409);
-  }
-  const existed = await get(
-    "SELECT * FROM event_registrations WHERE event_id = ? AND user_id = ?",
-    [id, req.auth.id]
-  );
-  if (existed) {
-    if (existed.status === "registered") {
-      return failResponse(res, "ALREADY_REGISTERED", "你已报名", 409);
+    if ((event.signup_type || "manual") !== "manual") {
+      return { error: ["NOT_AVAILABLE", "当前活动不支持站内报名", 403] };
     }
-    await run(
-      "UPDATE event_registrations SET status = 'registered' WHERE id = ?",
-      [existed.id]
+    const existed = await transaction.get(
+      "SELECT * FROM event_registrations WHERE event_id = ? AND user_id = ?",
+      [id, req.auth.id]
     );
-    await logAudit("event.register", req, "event", id, { mode: "reactivate" });
-    return okResponse(res, { eventId: id, status: "registered" });
-  }
-
-  await run(
-    "INSERT INTO event_registrations (event_id, user_id, status) VALUES (?, ?, 'registered')",
-    [id, req.auth.id]
-  );
-  await logAudit("event.register", req, "event", id);
-  return okResponse(res, { eventId: id, status: "registered" });
+    if (existed?.status === "registered") return { error: ["ALREADY_REGISTERED", "你已报名", 409] };
+    const regCount = await transaction.get(
+      "SELECT COUNT(*) AS total FROM event_registrations WHERE event_id = ? AND status = 'registered'",
+      [id]
+    );
+    if (event.capacity > 0 && regCount.total >= event.capacity) {
+      return { error: ["FULL", "名额已满", 409] };
+    }
+    if (existed) {
+      await transaction.run("UPDATE event_registrations SET status = 'registered' WHERE id = ?", [existed.id]);
+      return { payload: { eventId: id, status: "registered" }, mode: "reactivate" };
+    }
+    await transaction.run(
+      "INSERT INTO event_registrations (event_id, user_id, status) VALUES (?, ?, 'registered')",
+      [id, req.auth.id]
+    );
+    return { payload: { eventId: id, status: "registered" }, mode: "create" };
+  });
+  if (result.error) return failResponse(res, ...result.error);
+  await logAudit("event.register", req, "event", id, { mode: result.mode });
+  return okResponse(res, result.payload);
 });
 
 app.delete("/api/v1/events/:id/register", requireAuth, async (req, res) => {
@@ -1206,19 +1269,18 @@ app.delete("/api/v1/events/:id/register", requireAuth, async (req, res) => {
   if (!id) {
     return failResponse(res, "INVALID_ID", "活动 ID 不合法");
   }
-  const info = await get(
-    "SELECT * FROM event_registrations WHERE event_id = ? AND user_id = ? AND status = 'registered'",
-    [id, req.auth.id]
-  );
-  if (!info) {
-    return failResponse(res, "NOT_FOUND", "你当前未报名", 404);
-  }
-  await run(
-    "UPDATE event_registrations SET status = 'cancelled' WHERE id = ?",
-    [info.id]
-  );
+  const result = await withTransaction(async (transaction) => {
+    const info = await transaction.get(
+      "SELECT * FROM event_registrations WHERE event_id = ? AND user_id = ? AND status = 'registered'",
+      [id, req.auth.id]
+    );
+    if (!info) return { error: ["NOT_FOUND", "你当前未报名", 404] };
+    await transaction.run("UPDATE event_registrations SET status = 'cancelled' WHERE id = ?", [info.id]);
+    return { payload: { eventId: id, status: "cancelled" } };
+  });
+  if (result.error) return failResponse(res, ...result.error);
   await logAudit("event.unregister", req, "event", id);
-  return okResponse(res, { eventId: id, status: "cancelled" });
+  return okResponse(res, result.payload);
 });
 
 app.post("/api/v1/admin/events", requireAuth, requireAdmin, async (req, res) => {
@@ -2232,8 +2294,17 @@ app.use((err, _req, res, _next) => {
 let server;
 initializeSchema()
   .then(() => ensurePasswordColumns())
-  .then(() => ensureDemoSeed())
-  .then(() => {
+  .then(async () => {
+    if (process.env.DEMO_SEED_ONLY === "true" && !demoSeedAllowed()) {
+      throw new Error("DEMO_SEED_ENABLED=true is required for demo seeding");
+    }
+    if (demoSeedAllowed()) {
+      await ensureDemoSeed();
+    }
+    if (process.env.DEMO_SEED_ONLY === "true") {
+      await closeDb();
+      return;
+    }
     server = app.listen(PORT, HOST, () => {
       process.env.STARTED_AT = nowIso();
       console.log(`API ready: http://${HOST}:${PORT}`);

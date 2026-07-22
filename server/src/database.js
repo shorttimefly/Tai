@@ -78,6 +78,66 @@ function closeDb() {
   });
 }
 
+function transactionConnection() {
+  const connection = new sqlite3.Database(resolvedDbFile);
+
+  function transactionRun(sql, params = []) {
+    return new Promise((resolve, reject) => {
+      connection.run(sql, params, function onRun(err) {
+        if (err) return reject(err);
+        resolve(this);
+      });
+    });
+  }
+
+  function transactionGet(sql, params = []) {
+    return new Promise((resolve, reject) => {
+      connection.get(sql, params, (err, row) => {
+        if (err) return reject(err);
+        resolve(row);
+      });
+    });
+  }
+
+  function closeTransaction() {
+    return new Promise((resolve, reject) => {
+      connection.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  return { run: transactionRun, get: transactionGet, close: closeTransaction };
+}
+
+async function withTransaction(work) {
+  const transaction = transactionConnection();
+  let started = false;
+  try {
+    await transaction.run("PRAGMA foreign_keys = ON;");
+    await transaction.run("PRAGMA busy_timeout = 5000;");
+    await transaction.run("BEGIN IMMEDIATE;");
+    started = true;
+    const result = await work(transaction);
+    await transaction.run("COMMIT;");
+    started = false;
+    await transaction.close();
+    return result;
+  } catch (error) {
+    if (started) {
+      try {
+        await transaction.run("ROLLBACK;");
+      } catch (_rollbackError) {
+        // Preserve the operation error; the connection is still closed below.
+      }
+    }
+    try {
+      await transaction.close();
+    } catch (_closeError) {
+      // Preserve the operation error.
+    }
+    throw error;
+  }
+}
+
 function hashToken(raw) {
   return crypto.createHash("sha256").update(raw).digest("hex");
 }
@@ -89,6 +149,7 @@ module.exports = {
   all,
   initializeSchema,
   closeDb,
+  withTransaction,
   hashToken,
   resolvedDbFile,
 };

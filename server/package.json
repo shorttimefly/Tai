@@ -5,9 +5,12 @@
   "type": "commonjs",
   "scripts": {
     "dev": "node src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js",
+    "seed:demo": "DEMO_SEED_ENABLED=true DEMO_SEED_ONLY=true node src/index.js"
   },
   "dependencies": {
+    "argon2": "^0.45.0",
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
     "express": "^4.21.2",
